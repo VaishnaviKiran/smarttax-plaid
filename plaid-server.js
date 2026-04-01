@@ -17,16 +17,16 @@ const PORT = process.env.PORT || 3001;
 
 let ACCESS_TOKEN = null;
 let ITEM_ID = null;
+let transactionFeedback = {};
 
 // Webhook route must be mounted before express.json()
 app.use("/api/plaid/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 
-app.use(
-  cors({
-    origin: "http://localhost:3000",
-  })
-);
+app.use(cors({
+  origin: "http://localhost:8080",
+  credentials: true
+}));
 
 // Database
 const db = new Pool({
@@ -64,6 +64,177 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: "Invalid or expired token" });
   }
 }
+
+function roundToTwo(num) {
+  return Math.round(num * 100) / 100;
+}
+
+function classifyTransaction(transaction) {
+  const merchant = (transaction.merchant_name || transaction.name || "").toLowerCase();
+
+  let category = "other";
+  let confidence = 0.4;
+  const classification_signals = [];
+
+  if (merchant.includes("adobe")) {
+    category = "software";
+    confidence = 0.95;
+    classification_signals.push("merchant_name:adobe", "category:software_subscription");
+  } else if (merchant.includes("starbucks")) {
+    category = "meals";
+    confidence = 0.65;
+    classification_signals.push("merchant_name:starbucks", "category:food_and_drink");
+  } else if (merchant.includes("shell")) {
+    category = "car_expense";
+    confidence = 0.7;
+    classification_signals.push("merchant_name:shell", "category:transportation");
+  } else {
+    classification_signals.push("merchant_name:unknown");
+  }
+
+  let status = "needs_review";
+  let user_confirmed = null;
+
+
+  if (confidence >= 0.85) {
+    status = "confirmed";
+    user_confirmed = null;
+  } else if (confidence >= 0.5) {
+    status = "pending";
+    user_confirmed = null;
+  }
+
+  let deductiblePercent = 0;
+
+  if (category === "software") {
+    deductiblePercent = 1.0;
+  } else if (category === "meals") {
+    deductiblePercent = 0.5;
+  } else if (category === "car_expense") {
+    deductiblePercent = 0.7;
+  }
+
+  const deduction_amount = roundToTwo(transaction.amount * deductiblePercent);
+  const tax_rate_applied = 0.3;
+  const estimated_tax_savings = roundToTwo(deduction_amount * tax_rate_applied);
+
+  return {
+    category,
+    confidence_score: confidence,
+    status,
+    deduction_amount,
+    tax_rate_applied,
+    estimated_tax_savings,
+    user_confirmed,
+    classification_signals,
+  };
+}
+
+app.get("/api/mock-transactions", async (req, res) => {
+  try {
+    const mockTransactions = [
+      {
+        transaction_id: "tx_1",
+        name: "Adobe",
+        amount: 100,
+        merchant_name: "Adobe",
+        category: ["Software"],
+        date: "2026-04-01",
+      },
+      {
+        transaction_id: "tx_2",
+        name: "Starbucks",
+        amount: 12,
+        merchant_name: "Starbucks",
+        category: ["Food and Drink"],
+        date: "2026-04-01",
+      },
+      {
+        transaction_id: "tx_3",
+        name: "Shell",
+        amount: 45,
+        merchant_name: "Shell",
+        category: ["Transportation"],
+        date: "2026-04-01",
+      },
+      {
+        transaction_id: "tx_4",
+        name: "Random Store",
+        amount: 20,
+        merchant_name: "Random Store",
+        category: ["Shops"],
+        date: "2026-04-01",
+    }
+    ];
+
+  const enrichedTransactions = mockTransactions.map((transaction) => {
+  const classified = classifyTransaction(transaction);
+
+  const feedback = transactionFeedback[transaction.transaction_id];
+
+  let finalStatus = classified.status;
+  let user_confirmed = classified.user_confirmed;
+
+  if (feedback) {
+    user_confirmed = feedback.user_confirmed;
+    finalStatus = feedback.user_confirmed ? "confirmed" : "rejected";
+  }
+
+  return {
+    ...transaction,
+    auto_classification: classified.category,
+    confidence_score: classified.confidence_score,
+    status: finalStatus,
+    deduction_amount: classified.deduction_amount,
+    tax_rate_applied: classified.tax_rate_applied,
+    estimated_tax_savings: classified.estimated_tax_savings,
+    user_confirmed,
+    classification_signals: classified.classification_signals,
+  };
+});
+
+    res.json({
+      success: true,
+      transactions: enrichedTransactions,
+    });
+  } catch (error) {
+    console.error("MOCK TRANSACTIONS ERROR:", error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+app.post("/api/transaction-feedback", async (req, res) => {
+  try {
+    const { transaction_id, user_confirmed } = req.body;
+
+    if (!transaction_id || typeof user_confirmed !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        error: "transaction_id and user_confirmed are required",
+      });
+    }
+
+    transactionFeedback[transaction_id] = {
+      user_confirmed,
+      updated_at: new Date().toISOString(),
+    };
+
+    res.json({
+      success: true,
+      message: "Feedback saved successfully",
+      feedback: transactionFeedback[transaction_id],
+    });
+  } catch (error) {
+    console.error("TRANSACTION FEEDBACK ERROR:", error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
 
 // Create link token
 app.post("/api/plaid/create-link-token", async (req, res) => {
@@ -173,7 +344,6 @@ app.get("/api/plaid/accounts", async (req, res) => {
   }
 });
 
-// Get transactions
 app.get("/api/plaid/transactions", async (req, res) => {
   try {
     console.log("transactions route hit");
@@ -185,14 +355,32 @@ app.get("/api/plaid/transactions", async (req, res) => {
         .json({ error: "No access token found. Connect bank first." });
     }
 
+    // ✅ ADD THIS (you missed it)
     const response = await plaidClient.transactionsGet({
       access_token: ACCESS_TOKEN,
       start_date: "2025-01-01",
       end_date: "2026-12-31",
     });
 
-    console.log("transactions success:", response.data);
-    res.json(response.data);
+    // ✅ your logic (correct)
+    const enrichedTransactions = response.data.transactions.map((transaction) => {
+      const classified = classifyTransaction(transaction);
+
+      return {
+        ...transaction,
+        auto_classification: classified.category,
+        confidence_score: classified.confidence_score,
+        status: classified.status,
+        deduction_amount: classified.deduction_amount,
+      };
+    });
+
+    console.log("transactions success:", enrichedTransactions);
+
+    res.json({
+      ...response.data,
+      transactions: enrichedTransactions,
+    });
   } catch (error) {
     console.error(
       "TRANSACTIONS ERROR FULL:",
