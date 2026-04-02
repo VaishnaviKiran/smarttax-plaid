@@ -23,10 +23,12 @@ let transactionFeedback = {};
 app.use("/api/plaid/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 
-app.use(cors({
-  origin: "http://localhost:8080",
-  credentials: true
-}));
+app.use(
+  cors({
+    origin: ["http://localhost:3000", "http://localhost:8080"],
+    credentials: true,
+  })
+);
 
 // Database
 const db = new Pool({
@@ -73,45 +75,127 @@ function classifyTransaction(transaction) {
   const merchant = (transaction.merchant_name || transaction.name || "").toLowerCase();
 
   let category = "other";
-  let confidence = 0.4;
+  let confidence = 0.35;
+  let deductiblePercent = 0;
   const classification_signals = [];
 
-  if (merchant.includes("adobe")) {
-    category = "software";
+  if (
+    merchant.includes("adobe") ||
+    merchant.includes("figma") ||
+    merchant.includes("canva") ||
+    merchant.includes("notion") ||
+    merchant.includes("slack") ||
+    merchant.includes("github") ||
+    merchant.includes("aws") ||
+    merchant.includes("zoom") ||
+    merchant.includes("google workspace") ||
+    merchant.includes("dropbox") ||
+    merchant.includes("chatgpt") ||
+    merchant.includes("linkedin premium") ||
+    merchant.includes("shopify") ||
+    merchant.includes("quickbooks") ||
+    merchant.includes("squarespace")
+  ) {
+    category = "software_subscriptions";
     confidence = 0.95;
-    classification_signals.push("merchant_name:adobe", "category:software_subscription");
-  } else if (merchant.includes("starbucks")) {
-    category = "meals";
-    confidence = 0.65;
-    classification_signals.push("merchant_name:starbucks", "category:food_and_drink");
-  } else if (merchant.includes("shell")) {
-    category = "car_expense";
+    deductiblePercent = 1.0;
+    classification_signals.push("merchant_match:software_tools", "profile_match:business_tools");
+  } else if (
+    merchant.includes("office depot") ||
+    merchant.includes("staples") ||
+    merchant.includes("best buy") ||
+    merchant.includes("apple")
+  ) {
+    category = "equipment_hardware";
+    confidence = 0.9;
+    deductiblePercent = 1.0;
+    classification_signals.push("merchant_match:equipment", "category:hardware");
+  } else if (
+    merchant.includes("comcast") ||
+    merchant.includes("xfinity") ||
+    merchant.includes("verizon") ||
+    merchant.includes("at&t") ||
+    merchant.includes("tmobile") ||
+    merchant.includes("t-mobile")
+  ) {
+    category = "internet_phone";
     confidence = 0.7;
-    classification_signals.push("merchant_name:shell", "category:transportation");
+    deductiblePercent = 0.5;
+    classification_signals.push("merchant_match:internet_phone", "rule:partial_business_use");
+  } else if (
+    merchant.includes("uber") ||
+    merchant.includes("lyft") ||
+    merchant.includes("shell") ||
+    merchant.includes("chevron") ||
+    merchant.includes("exxon")
+  ) {
+    category = "travel_transport";
+    confidence = 0.72;
+    deductiblePercent = 0.7;
+    classification_signals.push("merchant_match:transport", "rule:mixed_use_possible");
+  } else if (
+    merchant.includes("starbucks") ||
+    merchant.includes("doordash") ||
+    merchant.includes("ubereats") ||
+    merchant.includes("chipotle") ||
+    merchant.includes("mcdonald")
+  ) {
+    category = "meals";
+    confidence = 0.6;
+    deductiblePercent = 0.5;
+    classification_signals.push("merchant_match:meals", "irs_rule:50_percent_limit");
+  } 
+  else if (
+  merchant.includes("openai") ||
+  merchant.includes("chatgpt")
+) {
+  category = "software_subscriptions";
+  confidence = 0.95;
+  deductiblePercent = 1.0;
+  classification_signals.push("merchant_match:ai_tools");
+} else if (
+  merchant.includes("zelle") ||
+  merchant.includes("payment") ||
+  merchant.includes("transfer") ||
+  merchant.includes("ach")
+) {
+  category = "personal_transfer";
+  confidence = 0.2;
+  deductiblePercent = 0;
+  classification_signals.push("rule:money_transfer_not_deductible");
+}else if (
+    merchant.includes("walmart") ||
+    merchant.includes("target") ||
+    merchant.includes("costco") ||
+    merchant.includes("grocery") ||
+    merchant.includes("whole foods") ||
+    merchant.includes("trader joe")
+  ) {
+    category = "personal";
+    confidence = 0.25;
+    deductiblePercent = 0;
+    classification_signals.push("merchant_match:personal_retail");
   } else {
-    classification_signals.push("merchant_name:unknown");
+    category = "other";
+    confidence = 0.4;
+    deductiblePercent = 0;
+    classification_signals.push("merchant_match:unknown");
   }
 
   let status = "needs_review";
   let user_confirmed = null;
+  let is_deductible = false;
 
-
+  // PDF logic
   if (confidence >= 0.85) {
     status = "confirmed";
-    user_confirmed = null;
+    is_deductible = true;
   } else if (confidence >= 0.5) {
     status = "pending";
-    user_confirmed = null;
-  }
-
-  let deductiblePercent = 0;
-
-  if (category === "software") {
-    deductiblePercent = 1.0;
-  } else if (category === "meals") {
-    deductiblePercent = 0.5;
-  } else if (category === "car_expense") {
-    deductiblePercent = 0.7;
+    is_deductible = true;
+  } else {
+    status = "needs_review";
+    is_deductible = false;
   }
 
   const deduction_amount = roundToTwo(transaction.amount * deductiblePercent);
@@ -122,6 +206,12 @@ function classifyTransaction(transaction) {
     category,
     confidence_score: confidence,
     status,
+    is_deductible,
+    deductible_label: is_deductible
+      ? deductiblePercent === 1
+        ? "100% Deductible"
+        : "Partially Deductible"
+      : "Not Deductible",
     deduction_amount,
     tax_rate_applied,
     estimated_tax_savings,
@@ -129,6 +219,36 @@ function classifyTransaction(transaction) {
     classification_signals,
   };
 }
+
+async function getSavedAccessToken() {
+  if (ACCESS_TOKEN) {
+    return ACCESS_TOKEN;
+  }
+
+  const result = await db.query(
+    `
+    SELECT access_token, item_id
+    FROM plaid_items
+    WHERE user_id = $1
+    ORDER BY updated_at DESC
+    LIMIT 1
+    `,
+    ["test-user-123"]
+  );
+
+  if (!result.rows.length) {
+    return null;
+  }
+
+  ACCESS_TOKEN = result.rows[0].access_token;
+  ITEM_ID = result.rows[0].item_id;
+
+  return ACCESS_TOKEN;
+}
+
+app.get("/", (req, res) => {
+  res.send("SmartTax Plaid backend is running");
+});
 
 app.get("/api/mock-transactions", async (req, res) => {
   try {
@@ -164,34 +284,33 @@ app.get("/api/mock-transactions", async (req, res) => {
         merchant_name: "Random Store",
         category: ["Shops"],
         date: "2026-04-01",
-    }
+      },
     ];
 
-  const enrichedTransactions = mockTransactions.map((transaction) => {
-  const classified = classifyTransaction(transaction);
+    const enrichedTransactions = mockTransactions.map((transaction) => {
+      const classified = classifyTransaction(transaction);
+      const feedback = transactionFeedback[transaction.transaction_id];
 
-  const feedback = transactionFeedback[transaction.transaction_id];
+      let finalStatus = classified.status;
+      let user_confirmed = classified.user_confirmed;
 
-  let finalStatus = classified.status;
-  let user_confirmed = classified.user_confirmed;
+      if (feedback) {
+        user_confirmed = feedback.user_confirmed;
+        finalStatus = feedback.user_confirmed ? "confirmed" : "rejected";
+      }
 
-  if (feedback) {
-    user_confirmed = feedback.user_confirmed;
-    finalStatus = feedback.user_confirmed ? "confirmed" : "rejected";
-  }
-
-  return {
-    ...transaction,
-    auto_classification: classified.category,
-    confidence_score: classified.confidence_score,
-    status: finalStatus,
-    deduction_amount: classified.deduction_amount,
-    tax_rate_applied: classified.tax_rate_applied,
-    estimated_tax_savings: classified.estimated_tax_savings,
-    user_confirmed,
-    classification_signals: classified.classification_signals,
-  };
-});
+      return {
+        ...transaction,
+        auto_classification: classified.category,
+        confidence_score: classified.confidence_score,
+        status: finalStatus,
+        deduction_amount: classified.deduction_amount,
+        tax_rate_applied: classified.tax_rate_applied,
+        estimated_tax_savings: classified.estimated_tax_savings,
+        user_confirmed,
+        classification_signals: classified.classification_signals,
+      };
+    });
 
     res.json({
       success: true,
@@ -318,20 +437,26 @@ app.post("/api/plaid/exchange_public_token", async (req, res) => {
 app.get("/api/plaid/accounts", async (req, res) => {
   try {
     console.log("accounts route hit");
-    console.log("ACCESS_TOKEN value:", ACCESS_TOKEN);
 
-    if (!ACCESS_TOKEN) {
-      return res
-        .status(400)
-        .json({ error: "No access token found. Connect bank first." });
+    const accessToken = await getSavedAccessToken();
+
+    if (!accessToken) {
+      return res.status(400).json({
+        error: "No access token found. Connect bank first.",
+      });
     }
 
     const response = await plaidClient.accountsGet({
-      access_token: ACCESS_TOKEN,
+      access_token: accessToken,
     });
 
     console.log("accounts success:", response.data);
-    res.json(response.data);
+
+    res.json({
+      success: true,
+      accounts: response.data.accounts,
+      item: response.data.item,
+    });
   } catch (error) {
     console.error(
       "ACCOUNTS ERROR FULL:",
@@ -344,41 +469,73 @@ app.get("/api/plaid/accounts", async (req, res) => {
   }
 });
 
+// Get transactions
 app.get("/api/plaid/transactions", async (req, res) => {
   try {
     console.log("transactions route hit");
-    console.log("ACCESS_TOKEN value:", ACCESS_TOKEN);
 
-    if (!ACCESS_TOKEN) {
-      return res
-        .status(400)
-        .json({ error: "No access token found. Connect bank first." });
+    const accessToken = await getSavedAccessToken();
+
+    if (!accessToken) {
+      return res.status(400).json({
+        error: "No access token found. Connect bank first.",
+      });
     }
 
-    // ✅ ADD THIS (you missed it)
     const response = await plaidClient.transactionsGet({
-      access_token: ACCESS_TOKEN,
+      access_token: accessToken,
       start_date: "2025-01-01",
       end_date: "2026-12-31",
     });
 
-    // ✅ your logic (correct)
     const enrichedTransactions = response.data.transactions.map((transaction) => {
       const classified = classifyTransaction(transaction);
+      const feedback = transactionFeedback[transaction.transaction_id];
+
+      let finalStatus = classified.status;
+      let finalDeductible = classified.is_deductible;
+      let finalLabel = classified.deductible_label;
+      let user_confirmed = classified.user_confirmed;
+
+      if (feedback) {
+        user_confirmed = feedback.user_confirmed;
+
+        if (feedback.user_confirmed === true) {
+          finalStatus = "confirmed";
+          finalDeductible = true;
+          finalLabel = classified.deductible_label;
+        } else if (feedback.user_confirmed === false) {
+          finalStatus = "rejected";
+          finalDeductible = false;
+          finalLabel = "Not Deductible";
+        }
+      }
 
       return {
-        ...transaction,
+        transaction_id: transaction.transaction_id,
+        name: transaction.name,
+        merchant_name: transaction.merchant_name,
+        amount: transaction.amount,
+        date: transaction.date,
+        category: transaction.category,
         auto_classification: classified.category,
         confidence_score: classified.confidence_score,
-        status: classified.status,
-        deduction_amount: classified.deduction_amount,
+        status: finalStatus,
+        is_deductible: finalDeductible,
+        deductible_label: finalLabel,
+        deduction_amount: finalDeductible ? classified.deduction_amount : 0,
+        tax_rate_applied: classified.tax_rate_applied,
+        estimated_tax_savings: finalDeductible ? classified.estimated_tax_savings : 0,
+        user_confirmed,
+        classification_signals: classified.classification_signals,
       };
     });
 
-    console.log("transactions success:", enrichedTransactions);
+    console.log("transactions success:", enrichedTransactions.length);
 
     res.json({
-      ...response.data,
+      success: true,
+      total_transactions: response.data.total_transactions,
       transactions: enrichedTransactions,
     });
   } catch (error) {
@@ -530,6 +687,19 @@ function decodeWebhookKeyId(token) {
   const header = JSON.parse(Buffer.from(headerB64, "base64url").toString());
   return header.kid;
 }
+app.get("/reset-bank", async (req, res) => {
+  try {
+    await db.query("DELETE FROM plaid_items");
+
+    ACCESS_TOKEN = null;
+    ITEM_ID = null;
+
+    res.send("Bank reset done ✅");
+  } catch (error) {
+    console.error(error);
+    res.status(500).send("Failed to reset bank");
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`SmartTax Plaid backend running on :${PORT}`);
