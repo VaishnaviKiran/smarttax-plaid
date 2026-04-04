@@ -20,7 +20,7 @@ const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:8080",
   "http://localhost:5173",
-  "https://main.d31qyojvcmiqs.amplifyapp.com",
+  "https://main.d31qyojvcmiiqs.amplifyapp.com", // 
 ];
 
 const corsOptions = {
