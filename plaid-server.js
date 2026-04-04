@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -14,13 +15,6 @@ const {
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-let ACCESS_TOKEN = null;
-let ITEM_ID = null;
-let transactionFeedback = {};
-
-// Webhook route must be mounted before express.json()
-app.use("/api/plaid/webhook", express.raw({ type: "application/json" }));
-app.use(express.json());
 
 const allowedOrigins = [
   "http://localhost:3000",
@@ -29,22 +23,26 @@ const allowedOrigins = [
   "https://main.d31qyojvcmiqs.amplifyapp.com",
 ];
 
-const cors = require("cors");
-
 const corsOptions = {
-  origin: [
-    "http://localhost:3000",
-    "http://localhost:8080",
-    "http://localhost:5173",
-    "https://main.d31qyojvcmiqs.amplifyapp.com",
-  ],
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 };
 
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
+
+// Webhook route must be mounted before express.json()
+app.use("/api/plaid/webhook", express.raw({ type: "application/json" }));
+app.use(express.json());
+
 
 // Database
 const db = new Pool({
