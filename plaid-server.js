@@ -24,7 +24,7 @@ app.use(express.json());
 
 app.use(
   cors({
-    origin: ["http://localhost:3000", "http://localhost:8080"],
+    origin: ["http://localhost:3000", "http://localhost:8080","http://localhost:5173"],
     credentials: true,
   })
 );
@@ -527,7 +527,7 @@ app.get("/api/plaid/transactions", async (req, res) => {
   try {
     console.log("transactions route hit");
 
-    const userId = "demo_user";
+    const userId = "test-user-123";
 
     const classifiedResult = await db.query(
       `
