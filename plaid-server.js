@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -20,7 +19,7 @@ const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:8080",
   "http://localhost:5173",
-  "https://main.d31qyojvcmiiqs.amplifyapp.com", // 
+  "https://main.d31qyojvcmiiqs.amplifyapp.com",
 ];
 
 const corsOptions = {
@@ -43,7 +42,6 @@ app.options(/.*/, cors(corsOptions));
 app.use("/api/plaid/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 
-
 // Database
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -63,6 +61,9 @@ const plaidConfig = new Configuration({
 });
 
 const plaidClient = new PlaidApi(plaidConfig);
+
+// Temporary in-memory feedback store
+const transactionFeedback = {};
 
 // Optional auth middleware
 function requireAuth(req, res, next) {
@@ -158,26 +159,25 @@ function classifyTransaction(transaction) {
     confidence = 0.6;
     deductiblePercent = 0.5;
     classification_signals.push("merchant_match:meals", "irs_rule:50_percent_limit");
-  } 
-  else if (
-  merchant.includes("openai") ||
-  merchant.includes("chatgpt")
-) {
-  category = "software_subscriptions";
-  confidence = 0.95;
-  deductiblePercent = 1.0;
-  classification_signals.push("merchant_match:ai_tools");
-} else if (
-  merchant.includes("zelle") ||
-  merchant.includes("payment") ||
-  merchant.includes("transfer") ||
-  merchant.includes("ach")
-) {
-  category = "personal_transfer";
-  confidence = 0.2;
-  deductiblePercent = 0;
-  classification_signals.push("rule:money_transfer_not_deductible");
-}else if (
+  } else if (
+    merchant.includes("openai") ||
+    merchant.includes("chatgpt")
+  ) {
+    category = "software_subscriptions";
+    confidence = 0.95;
+    deductiblePercent = 1.0;
+    classification_signals.push("merchant_match:ai_tools");
+  } else if (
+    merchant.includes("zelle") ||
+    merchant.includes("payment") ||
+    merchant.includes("transfer") ||
+    merchant.includes("ach")
+  ) {
+    category = "personal_transfer";
+    confidence = 0.2;
+    deductiblePercent = 0;
+    classification_signals.push("rule:money_transfer_not_deductible");
+  } else if (
     merchant.includes("walmart") ||
     merchant.includes("target") ||
     merchant.includes("costco") ||
@@ -200,7 +200,6 @@ function classifyTransaction(transaction) {
   let user_confirmed = null;
   let is_deductible = false;
 
-  // PDF logic
   if (confidence >= 0.85) {
     status = "confirmed";
     is_deductible = true;
@@ -234,30 +233,23 @@ function classifyTransaction(transaction) {
   };
 }
 
-async function getSavedAccessToken() {
-  if (ACCESS_TOKEN) {
-    return ACCESS_TOKEN;
-  }
-
+async function getSavedAccessToken(userId) {
   const result = await db.query(
     `
-    SELECT access_token, item_id
+    SELECT access_token
     FROM plaid_items
     WHERE user_id = $1
     ORDER BY updated_at DESC
     LIMIT 1
     `,
-    ["test-user-123"]
+    [userId]
   );
 
   if (!result.rows.length) {
     return null;
   }
 
-  ACCESS_TOKEN = result.rows[0].access_token;
-  ITEM_ID = result.rows[0].item_id;
-
-  return ACCESS_TOKEN;
+  return result.rows[0].access_token;
 }
 
 app.get("/", (req, res) => {
@@ -303,7 +295,8 @@ app.get("/api/mock-transactions", async (req, res) => {
 
     const enrichedTransactions = mockTransactions.map((transaction) => {
       const classified = classifyTransaction(transaction);
-      const feedback = transactionFeedback[transaction.transaction_id];
+      const userId = req.query.userId || "mock-user";
+      const feedback = transactionFeedback[`${userId}:${transaction.transaction_id}`];
 
       let finalStatus = classified.status;
       let user_confirmed = classified.user_confirmed;
@@ -338,12 +331,13 @@ app.get("/api/mock-transactions", async (req, res) => {
     });
   }
 });
+
 app.post("/api/transaction/reject", async (req, res) => {
   try {
-    const { transaction_id } = req.body;
+    const { userId, transaction_id } = req.body;
 
-    if (!transaction_id) {
-      return res.status(400).json({ error: "transaction_id required" });
+    if (!userId || !transaction_id) {
+      return res.status(400).json({ error: "userId and transaction_id required" });
     }
 
     const manualUpdate = await db.query(
@@ -356,10 +350,10 @@ app.post("/api/transaction/reject", async (req, res) => {
         deduction_amount = 0,
         estimated_tax_savings = 0,
         user_confirmed = false
-      WHERE id = $1
+      WHERE id = $1 AND user_id = $2
       RETURNING *
       `,
-      [transaction_id]
+      [transaction_id, userId]
     );
 
     const classifiedUpdate = await db.query(
@@ -372,10 +366,10 @@ app.post("/api/transaction/reject", async (req, res) => {
         deduction_amount = 0,
         estimated_tax_savings = 0,
         user_confirmed = false
-      WHERE transaction_id = $1
+      WHERE transaction_id = $1 AND user_id = $2
       RETURNING *
       `,
-      [transaction_id]
+      [transaction_id, userId]
     );
 
     res.json({
@@ -394,16 +388,18 @@ app.post("/api/transaction/reject", async (req, res) => {
 
 app.post("/api/transaction-feedback", async (req, res) => {
   try {
-    const { transaction_id, user_confirmed } = req.body;
+    const { userId, transaction_id, user_confirmed } = req.body;
 
-    if (!transaction_id || typeof user_confirmed !== "boolean") {
+    if (!userId || !transaction_id || typeof user_confirmed !== "boolean") {
       return res.status(400).json({
         success: false,
-        error: "transaction_id and user_confirmed are required",
+        error: "userId, transaction_id and user_confirmed are required",
       });
     }
 
-    transactionFeedback[transaction_id] = {
+    const key = `${userId}:${transaction_id}`;
+
+    transactionFeedback[key] = {
       user_confirmed,
       updated_at: new Date().toISOString(),
     };
@@ -411,7 +407,7 @@ app.post("/api/transaction-feedback", async (req, res) => {
     res.json({
       success: true,
       message: "Feedback saved successfully",
-      feedback: transactionFeedback[transaction_id],
+      feedback: transactionFeedback[key],
     });
   } catch (error) {
     console.error("TRANSACTION FEEDBACK ERROR:", error.message);
@@ -425,8 +421,14 @@ app.post("/api/transaction-feedback", async (req, res) => {
 // Create link token
 app.post("/api/plaid/create-link-token", async (req, res) => {
   try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
     const response = await plaidClient.linkTokenCreate({
-      user: { client_user_id: "test-user-123" },
+      user: { client_user_id: userId },
       client_name: "SmartTax AI",
       products: [Products.Transactions],
       country_codes: [CountryCode.Us],
@@ -453,20 +455,20 @@ app.post("/api/plaid/exchange_public_token", async (req, res) => {
     console.log("exchange route hit");
     console.log("req.body:", req.body);
 
-    const { public_token } = req.body;
+    const { public_token, userId } = req.body;
 
-    if (!public_token) {
-      return res
-        .status(400)
-        .json({ error: "public_token is missing from request body" });
+    if (!public_token || !userId) {
+      return res.status(400).json({
+        error: "public_token and userId are required",
+      });
     }
 
     const response = await plaidClient.itemPublicTokenExchange({
       public_token,
     });
 
-    ACCESS_TOKEN = response.data.access_token;
-    ITEM_ID = response.data.item_id;
+    const accessToken = response.data.access_token;
+    const itemId = response.data.item_id;
 
     await db.query(
       `
@@ -475,18 +477,17 @@ app.post("/api/plaid/exchange_public_token", async (req, res) => {
       ON CONFLICT (item_id)
       DO UPDATE SET
         access_token = EXCLUDED.access_token,
+        user_id = EXCLUDED.user_id,
         updated_at = NOW()
       `,
-      ["test-user-123", ACCESS_TOKEN, ITEM_ID]
+      [userId, accessToken, itemId]
     );
 
-    console.log("ACCESS_TOKEN saved:", ACCESS_TOKEN);
-    console.log("ITEM_ID saved:", ITEM_ID);
-    console.log("Saved Plaid item in DB");
+    console.log("Saved Plaid item in DB for user:", userId);
 
     res.json({
       success: true,
-      item_id: ITEM_ID,
+      item_id: itemId,
     });
   } catch (error) {
     console.error(
@@ -505,7 +506,13 @@ app.get("/api/plaid/accounts", async (req, res) => {
   try {
     console.log("accounts route hit");
 
-    const accessToken = await getSavedAccessToken();
+    const userId = req.query.userId;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
+    const accessToken = await getSavedAccessToken(userId);
 
     if (!accessToken) {
       return res.status(400).json({
@@ -541,7 +548,11 @@ app.get("/api/plaid/transactions", async (req, res) => {
   try {
     console.log("transactions route hit");
 
-    const userId = "test-user-123";
+    const userId = req.query.userId;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
 
     const classifiedResult = await db.query(
       `
@@ -631,7 +642,11 @@ app.get("/api/plaid/transactions", async (req, res) => {
 
 app.get("/api/plaid/export-csv", async (req, res) => {
   try {
-    const userId = "test-user-123";
+    const userId = req.query.userId;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
 
     const classifiedResult = await db.query(
       `
@@ -712,7 +727,6 @@ app.get("/api/plaid/export-csv", async (req, res) => {
   }
 });
 
-
 // Test DB
 app.get("/api/test-db", async (req, res) => {
   try {
@@ -733,16 +747,28 @@ app.get("/api/test-db", async (req, res) => {
 // Show saved Plaid items
 app.get("/api/plaid/db-items", async (req, res) => {
   try {
+    const userId = req.query.userId;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
     const result = await db.query(
-      "SELECT user_id, item_id, created_at, updated_at FROM plaid_items ORDER BY updated_at DESC"
+      `
+      SELECT user_id, item_id, created_at, updated_at
+      FROM plaid_items
+      WHERE user_id = $1
+      ORDER BY updated_at DESC
+      `,
+      [userId]
     );
+
     res.json(result.rows);
   } catch (error) {
     console.error("DB ITEMS ERROR:", error.message);
     res.status(500).json({ error: "Failed to fetch db items" });
   }
 });
-// ✅ STEP 1: put helper HERE (top section of file)
 
 const syncTransactionsToDb = async (userId, accessToken) => {
   const response = await plaidClient.transactionsSync({
@@ -805,9 +831,16 @@ const syncTransactionsToDb = async (userId, accessToken) => {
 
   return { added_count: added.length };
 };
+
 app.post("/api/plaid/sync-transactions", async (req, res) => {
   try {
-    const accessToken = await getSavedAccessToken();
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
+    const accessToken = await getSavedAccessToken(userId);
 
     if (!accessToken) {
       return res.status(400).json({
@@ -815,7 +848,7 @@ app.post("/api/plaid/sync-transactions", async (req, res) => {
       });
     }
 
-    const result = await syncTransactionsToDb("test-user-123", accessToken);
+    const result = await syncTransactionsToDb(userId, accessToken);
 
     res.json({
       success: true,
@@ -829,6 +862,7 @@ app.post("/api/plaid/sync-transactions", async (req, res) => {
     });
   }
 });
+
 // Webhook
 app.post("/api/plaid/webhook", async (req, res) => {
   const plaidVerificationToken = req.headers["plaid-verification"];
@@ -883,8 +917,8 @@ app.post("/api/plaid/webhook", async (req, res) => {
       ].includes(webhook_code)
     ) {
       syncTransactionsToDb(user_id, access_token).catch((error) =>
-  console.error(`Webhook sync failed for ${user_id}:`, error.message)
-);
+        console.error(`Webhook sync failed for ${user_id}:`, error.message)
+      );
     }
   }
 
@@ -1020,7 +1054,7 @@ async function syncTransactions(userId, accessToken, itemId) {
         user_confirmed = $13,
         classification_signals = $14,
         updated_at = NOW()
-      WHERE transaction_id = $15
+      WHERE transaction_id = $15 AND user_id = $16
       `,
       [
         tx.name,
@@ -1038,16 +1072,17 @@ async function syncTransactions(userId, accessToken, itemId) {
         classified.user_confirmed,
         JSON.stringify(classified.classification_signals),
         tx.transaction_id,
+        userId,
       ]
     );
   }
 
   for (const tx of removed) {
-    await db.query(
-      "DELETE FROM classified_transactions WHERE transaction_id = $1",
-      [tx.transaction_id]
-    );
-  }
+  await db.query(
+    "DELETE FROM classified_transactions WHERE transaction_id = $1 AND user_id = $2",
+    [tx.transaction_id, userId]
+  );
+}
 
   console.log(
     `[${userId}] Sync complete: +${added.length} added, ${modified.length} modified, ${removed.length} removed`
@@ -1061,12 +1096,18 @@ function decodeWebhookKeyId(token) {
   const header = JSON.parse(Buffer.from(headerB64, "base64url").toString());
   return header.kid;
 }
+
 app.get("/reset-bank", async (req, res) => {
   try {
-    await db.query("DELETE FROM plaid_items");
+    const userId = req.query.userId;
 
-    ACCESS_TOKEN = null;
-    ITEM_ID = null;
+    if (!userId) {
+      return res.status(400).send("userId is required");
+    }
+
+    await db.query("DELETE FROM plaid_items WHERE user_id = $1", [userId]);
+    await db.query("DELETE FROM classified_transactions WHERE user_id = $1", [userId]);
+    await db.query("DELETE FROM manual_transactions WHERE user_id = $1", [userId]);
 
     res.send("Bank reset done ✅");
   } catch (error) {
@@ -1077,7 +1118,13 @@ app.get("/reset-bank", async (req, res) => {
 
 app.post("/api/plaid/sandbox/fire-webhook", async (req, res) => {
   try {
-    const accessToken = await getSavedAccessToken();
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
+    const accessToken = await getSavedAccessToken(userId);
 
     if (!accessToken) {
       return res.status(400).json({
@@ -1149,11 +1196,11 @@ app.post("/api/manual-entry", async (req, res) => {
 
 app.post("/api/manual-transaction", async (req, res) => {
   try {
-    const { description, amount, date, merchant_name } = req.body;
+    const { userId, description, amount, date, merchant_name } = req.body;
 
-    if (!description || typeof amount !== "number" || !date) {
+    if (!userId || !description || typeof amount !== "number" || !date) {
       return res.status(400).json({
-        error: "description, amount, and date are required",
+        error: "userId, description, amount, and date are required",
       });
     }
 
@@ -1191,7 +1238,7 @@ app.post("/api/manual-transaction", async (req, res) => {
       ) RETURNING *`,
       [
         manualTx.transaction_id,
-        "test-user-123",
+        userId,
         description,
         amount,
         date,
@@ -1222,15 +1269,17 @@ app.post("/api/manual-transaction", async (req, res) => {
   }
 });
 
-
 app.get("/test-manual", async (req, res) => {
   try {
+    const userId = req.query.userId || "test-user-local";
+
     const response = await fetch("http://localhost:3001/api/manual-transaction", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
+        userId,
         description: "Adobe subscription",
         amount: 50,
         date: "2026-04-02",
@@ -1276,6 +1325,7 @@ app.get("/create-table", async (req, res) => {
     res.status(500).send("error creating table");
   }
 });
+
 app.get("/create-classified-table", async (req, res) => {
   try {
     await db.query(`
@@ -1310,39 +1360,41 @@ app.get("/create-classified-table", async (req, res) => {
     res.status(500).send("error creating classified_transactions table");
   }
 });
+
 app.post("/api/transaction/confirm", async (req, res) => {
   try {
-    const { transaction_id } = req.body;
+    const { userId, transaction_id } = req.body;
 
-    if (!transaction_id) {
-      return res.status(400).json({ error: "transaction_id required" });
+    if (!userId || !transaction_id) {
+      return res.status(400).json({ error: "userId and transaction_id required" });
     }
 
-    // Update BOTH tables (safe approach)
     await db.query(
       `
       UPDATE manual_transactions
-      SET 
+      SET
         status = 'confirmed',
         is_deductible = true,
         deduction_amount = amount,
-        estimated_tax_savings = amount * 0.3
-      WHERE id = $1
+        estimated_tax_savings = amount * 0.3,
+        user_confirmed = true
+      WHERE id = $1 AND user_id = $2
       `,
-      [transaction_id]
+      [transaction_id, userId]
     );
 
     await db.query(
       `
       UPDATE classified_transactions
-      SET 
+      SET
         status = 'confirmed',
         is_deductible = true,
         deduction_amount = amount,
-        estimated_tax_savings = amount * 0.3
-      WHERE transaction_id = $1
+        estimated_tax_savings = amount * 0.3,
+        user_confirmed = true
+      WHERE transaction_id = $1 AND user_id = $2
       `,
-      [transaction_id]
+      [transaction_id, userId]
     );
 
     res.json({ success: true });
