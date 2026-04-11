@@ -202,40 +202,32 @@ function classifyTransaction(transaction) {
   }
 
   let status = "needs_review";
-  let user_confirmed = null;
-  let is_deductible = false;
+let user_confirmed = null;
 
-  if (confidence >= 0.85) {
-    status = "confirmed";
-    is_deductible = true;
-  } else if (confidence >= 0.5) {
-    status = "pending";
-    is_deductible = true;
-  } else {
-    status = "needs_review";
-    is_deductible = false;
-  }
+// suggestion only — not final decision
+const suggested_deductible = deductiblePercent > 0;
+let is_deductible = suggested_deductible;
 
   const deduction_amount = roundToTwo(transaction.amount * deductiblePercent);
   const tax_rate_applied = 0.3;
   const estimated_tax_savings = roundToTwo(deduction_amount * tax_rate_applied);
 
   return {
-    category,
-    confidence_score: confidence,
-    status,
-    is_deductible,
-    deductible_label: is_deductible
-      ? deductiblePercent === 1
-        ? "100% Deductible"
-        : "Partially Deductible"
-      : "Not Deductible",
-    deduction_amount,
-    tax_rate_applied,
-    estimated_tax_savings,
-    user_confirmed,
-    classification_signals,
-  };
+  category,
+  confidence_score: confidence,
+  status, // always needs_review until user decides
+  is_deductible,
+  deductible_label: suggested_deductible
+    ? deductiblePercent === 1
+      ? "100% Deductible"
+      : "Partially Deductible"
+    : "Not Deductible",
+  deduction_amount,
+  tax_rate_applied,
+  estimated_tax_savings,
+  user_confirmed,
+  classification_signals,
+};
 }
 
 async function getAISuggestion(transaction) {
@@ -370,6 +362,55 @@ app.get("/api/mock-transactions", async (req, res) => {
   }
 });
 
+app.post("/api/transaction/confirm", async (req, res) => {
+  try {
+    const { userId, transaction_id } = req.body;
+
+    if (!userId || !transaction_id) {
+      return res.status(400).json({ error: "userId and transaction_id required" });
+    }
+
+    const manualUpdate = await db.query(
+      `
+      UPDATE manual_transactions
+      SET
+        status = 'confirmed',
+        user_confirmed = true,
+        updated_at = NOW()
+      WHERE id = $1 AND user_id = $2
+      RETURNING *
+      `,
+      [transaction_id, userId]
+    );
+
+    const classifiedUpdate = await db.query(
+      `
+      UPDATE classified_transactions
+      SET
+        status = 'confirmed',
+        user_confirmed = true,
+        updated_at = NOW()
+      WHERE transaction_id = $1 AND user_id = $2
+      RETURNING *
+      `,
+      [transaction_id, userId]
+    );
+
+    return res.json({
+      success: true,
+      manual_updated: manualUpdate.rowCount,
+      classified_updated: classifiedUpdate.rowCount,
+      transaction: manualUpdate.rows[0] || classifiedUpdate.rows[0] || null,
+    });
+  } catch (err) {
+    console.error("Confirm transaction error:", err);
+    return res.status(500).json({
+      error: "Failed to confirm transaction",
+      details: err.message,
+    });
+  }
+});
+
 app.post("/api/transaction/reject", async (req, res) => {
   try {
     const { userId, transaction_id } = req.body;
@@ -387,7 +428,8 @@ app.post("/api/transaction/reject", async (req, res) => {
         deductible_label = 'Not Deductible',
         deduction_amount = 0,
         estimated_tax_savings = 0,
-        user_confirmed = false
+        user_confirmed = false,
+        updated_at = NOW()
       WHERE id = $1 AND user_id = $2
       RETURNING *
       `,
@@ -403,21 +445,23 @@ app.post("/api/transaction/reject", async (req, res) => {
         deductible_label = 'Not Deductible',
         deduction_amount = 0,
         estimated_tax_savings = 0,
-        user_confirmed = false
+        user_confirmed = false,
+        updated_at = NOW()
       WHERE transaction_id = $1 AND user_id = $2
       RETURNING *
       `,
       [transaction_id, userId]
     );
 
-    res.json({
+    return res.json({
       success: true,
       manual_updated: manualUpdate.rowCount,
       classified_updated: classifiedUpdate.rowCount,
+      transaction: manualUpdate.rows[0] || classifiedUpdate.rows[0] || null,
     });
   } catch (err) {
     console.error("Reject transaction error:", err);
-    res.status(500).json({
+    return res.status(500).json({
       error: "Failed to reject transaction",
       details: err.message,
     });
@@ -773,19 +817,55 @@ app.post("/api/plaid/update-transaction-status", async (req, res) => {
       return res.status(400).json({ error: "Missing fields" });
     }
 
-    // 🔥 Update in DB (adjust table name if needed)
-    const result = await db.query(
-      `UPDATE transactions
-       SET status = $1
-       WHERE transaction_id = $2 AND user_id = $3
-       RETURNING *`,
-      [status, transactionId, userId]
+    if (!["confirmed", "rejected"].includes(status)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
+
+    const isConfirmed = status === "confirmed";
+
+    const manualUpdate = await db.query(
+      `
+      UPDATE manual_transactions
+      SET
+        status = $1,
+        user_confirmed = $2,
+        is_deductible = CASE WHEN $2 = false THEN false ELSE is_deductible END,
+        deductible_label = CASE WHEN $2 = false THEN 'Not Deductible' ELSE deductible_label END,
+        deduction_amount = CASE WHEN $2 = false THEN 0 ELSE deduction_amount END,
+        estimated_tax_savings = CASE WHEN $2 = false THEN 0 ELSE estimated_tax_savings END,
+        updated_at = NOW()
+      WHERE id = $3 AND user_id = $4
+      RETURNING *
+      `,
+      [status, isConfirmed, transactionId, userId]
     );
 
-    return res.json({ success: true, data: result.rows[0] });
+    const classifiedUpdate = await db.query(
+      `
+      UPDATE classified_transactions
+      SET
+        status = $1,
+        user_confirmed = $2,
+        is_deductible = CASE WHEN $2 = false THEN false ELSE is_deductible END,
+        deductible_label = CASE WHEN $2 = false THEN 'Not Deductible' ELSE deductible_label END,
+        deduction_amount = CASE WHEN $2 = false THEN 0 ELSE deduction_amount END,
+        estimated_tax_savings = CASE WHEN $2 = false THEN 0 ELSE estimated_tax_savings END,
+        updated_at = NOW()
+      WHERE transaction_id = $3 AND user_id = $4
+      RETURNING *
+      `,
+      [status, isConfirmed, transactionId, userId]
+    );
+
+    return res.json({
+      success: true,
+      manual_updated: manualUpdate.rowCount,
+      classified_updated: classifiedUpdate.rowCount,
+      data: manualUpdate.rows[0] || classifiedUpdate.rows[0] || null,
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to update transaction" });
+    console.error("Failed to update transaction:", err);
+    return res.status(500).json({ error: "Failed to update transaction" });
   }
 });
 
