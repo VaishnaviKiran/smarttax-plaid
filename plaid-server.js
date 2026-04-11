@@ -1575,6 +1575,7 @@ app.post("/api/transaction/confirm", async (req, res) => {
     const updatedTx = manualUpdate.rows[0] || classifiedUpdate.rows[0] || null;
 
 if (updatedTx) {
+
   await saveFeedback({
     userId,
     transactionId: transaction_id,
