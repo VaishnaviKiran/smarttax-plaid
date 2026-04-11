@@ -1551,9 +1551,6 @@ app.post("/api/transaction/confirm", async (req, res) => {
       UPDATE manual_transactions
       SET
         status = 'confirmed',
-        is_deductible = true,
-        deduction_amount = amount,
-        estimated_tax_savings = amount * 0.3,
         user_confirmed = true,
         updated_at = NOW()
       WHERE id = $1 AND user_id = $2
@@ -1567,9 +1564,6 @@ app.post("/api/transaction/confirm", async (req, res) => {
       UPDATE classified_transactions
       SET
         status = 'confirmed',
-        is_deductible = true,
-        deduction_amount = amount,
-        estimated_tax_savings = amount * 0.3,
         user_confirmed = true,
         updated_at = NOW()
       WHERE transaction_id = $1 AND user_id = $2
@@ -1578,26 +1572,11 @@ app.post("/api/transaction/confirm", async (req, res) => {
       [transaction_id, userId]
     );
 
-    const updatedTx = manualUpdate.rows[0] || classifiedUpdate.rows[0] || null;
-
-    if (updatedTx) {
-      await saveFeedback({
-        userId,
-        transactionId: transaction_id,
-        merchantName:
-          updatedTx.merchant_name ||
-          updatedTx.name ||
-          updatedTx.description ||
-          "unknown",
-        finalLabel: "business",
-      });
-    }
-
     return res.json({
       success: true,
       manual_updated: manualUpdate.rowCount,
       classified_updated: classifiedUpdate.rowCount,
-      transaction: updatedTx,
+      transaction: manualUpdate.rows[0] || classifiedUpdate.rows[0] || null,
     });
   } catch (err) {
     console.error("Confirm transaction error:", err);
