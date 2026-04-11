@@ -1572,6 +1572,21 @@ app.post("/api/transaction/confirm", async (req, res) => {
       [transaction_id, userId]
     );
 
+    const updatedTx = manualUpdate.rows[0] || classifiedUpdate.rows[0] || null;
+
+if (updatedTx) {
+  await saveFeedback({
+    userId,
+    transactionId: transaction_id,
+    merchantName:
+      updatedTx.merchant_name ||
+      updatedTx.name ||
+      updatedTx.description ||
+      "unknown",
+    finalLabel: "business",
+  });
+}
+
     return res.json({
       success: true,
       manual_updated: manualUpdate.rowCount,
