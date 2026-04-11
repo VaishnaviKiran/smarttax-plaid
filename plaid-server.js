@@ -1033,7 +1033,16 @@ async function syncTransactions(userId, accessToken, itemId) {
   );
 
   for (const tx of added) {
-    const classified = classifyTransaction(tx);
+    const ruleBased = classifyTransaction(tx);
+    const ai = await getAISuggestion(tx);
+
+    let finalConfidence = ruleBased.confidence_score;
+    let aiReason = null;
+
+    if (ai) {
+      finalConfidence = (ruleBased.confidence_score + ai.confidence) / 2;
+      aiReason = ai.reason;
+    }
 
     await db.query(
       `
@@ -1091,23 +1100,35 @@ async function syncTransactions(userId, accessToken, itemId) {
         tx.merchant_name,
         tx.amount,
         tx.date,
-        classified.category,
-        classified.confidence_score,
-        classified.status,
-        classified.is_deductible,
-        classified.deductible_label,
-        classified.deduction_amount,
-        classified.tax_rate_applied,
-        classified.estimated_tax_savings,
-        classified.user_confirmed,
-        JSON.stringify(classified.classification_signals),
+        ruleBased.category,
+        finalConfidence,
+        ruleBased.status,
+        ruleBased.is_deductible,
+        ruleBased.deductible_label,
+        ruleBased.deduction_amount,
+        ruleBased.tax_rate_applied,
+        ruleBased.estimated_tax_savings,
+        ruleBased.user_confirmed,
+        JSON.stringify({
+          signals: ruleBased.classification_signals || [],
+          ai_reason: aiReason,
+        }),
         "plaid",
       ]
     );
   }
 
   for (const tx of modified) {
-    const classified = classifyTransaction(tx);
+    const ruleBased = classifyTransaction(tx);
+    const ai = await getAISuggestion(tx);
+
+    let finalConfidence = ruleBased.confidence_score;
+    let aiReason = null;
+
+    if (ai) {
+      finalConfidence = (ruleBased.confidence_score + ai.confidence) / 2;
+      aiReason = ai.reason;
+    }
 
     await db.query(
       `
@@ -1135,16 +1156,19 @@ async function syncTransactions(userId, accessToken, itemId) {
         tx.merchant_name,
         tx.amount,
         tx.date,
-        classified.category,
-        classified.confidence_score,
-        classified.status,
-        classified.is_deductible,
-        classified.deductible_label,
-        classified.deduction_amount,
-        classified.tax_rate_applied,
-        classified.estimated_tax_savings,
-        classified.user_confirmed,
-        JSON.stringify(classified.classification_signals),
+        ruleBased.category,
+        finalConfidence,
+        ruleBased.status,
+        ruleBased.is_deductible,
+        ruleBased.deductible_label,
+        ruleBased.deduction_amount,
+        ruleBased.tax_rate_applied,
+        ruleBased.estimated_tax_savings,
+        ruleBased.user_confirmed,
+        JSON.stringify({
+          signals: ruleBased.classification_signals || [],
+          ai_reason: aiReason,
+        }),
         tx.transaction_id,
         userId,
       ]
@@ -1152,11 +1176,11 @@ async function syncTransactions(userId, accessToken, itemId) {
   }
 
   for (const tx of removed) {
-  await db.query(
-    "DELETE FROM classified_transactions WHERE transaction_id = $1 AND user_id = $2",
-    [tx.transaction_id, userId]
-  );
-}
+    await db.query(
+      "DELETE FROM classified_transactions WHERE transaction_id = $1 AND user_id = $2",
+      [tx.transaction_id, userId]
+    );
+  }
 
   console.log(
     `[${userId}] Sync complete: +${added.length} added, ${modified.length} modified, ${removed.length} removed`
