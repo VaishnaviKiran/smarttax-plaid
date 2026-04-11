@@ -453,11 +453,26 @@ app.post("/api/transaction/reject", async (req, res) => {
       [transaction_id, userId]
     );
 
+    const updatedTx = manualUpdate.rows[0] || classifiedUpdate.rows[0] || null;
+
+    if (updatedTx) {
+      await saveFeedback({
+        userId,
+        transactionId: transaction_id,
+        merchantName:
+          updatedTx.merchant_name ||
+          updatedTx.name ||
+          updatedTx.description ||
+          "unknown",
+        finalLabel: "personal",
+      });
+    }
+
     return res.json({
       success: true,
       manual_updated: manualUpdate.rowCount,
       classified_updated: classifiedUpdate.rowCount,
-      transaction: manualUpdate.rows[0] || classifiedUpdate.rows[0] || null,
+      transaction: updatedTx,
     });
   } catch (err) {
     console.error("Reject transaction error:", err);
@@ -1275,6 +1290,34 @@ function decodeWebhookKeyId(token) {
   return header.kid;
 }
 
+function normalizeMerchantKey(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/[*#0-9]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function saveFeedback({ userId, transactionId, merchantName, finalLabel }) {
+  const merchantKey = normalizeMerchantKey(merchantName);
+
+  await db.query(
+    `
+    INSERT INTO transaction_feedback (
+      user_id,
+      merchant_key,
+      transaction_id,
+      final_label,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, NOW(), NOW())
+    `,
+    [userId, merchantKey, transactionId, finalLabel]
+  );
+}
+
+
 app.get("/reset-bank", async (req, res) => {
   try {
     const userId = req.query.userId;
@@ -1550,7 +1593,7 @@ app.post("/api/transaction/confirm", async (req, res) => {
       return res.status(400).json({ error: "userId and transaction_id required" });
     }
 
-    await db.query(
+    const manualUpdate = await db.query(
       `
       UPDATE manual_transactions
       SET
@@ -1558,13 +1601,15 @@ app.post("/api/transaction/confirm", async (req, res) => {
         is_deductible = true,
         deduction_amount = amount,
         estimated_tax_savings = amount * 0.3,
-        user_confirmed = true
+        user_confirmed = true,
+        updated_at = NOW()
       WHERE id = $1 AND user_id = $2
+      RETURNING *
       `,
       [transaction_id, userId]
     );
 
-    await db.query(
+    const classifiedUpdate = await db.query(
       `
       UPDATE classified_transactions
       SET
@@ -1572,16 +1617,41 @@ app.post("/api/transaction/confirm", async (req, res) => {
         is_deductible = true,
         deduction_amount = amount,
         estimated_tax_savings = amount * 0.3,
-        user_confirmed = true
+        user_confirmed = true,
+        updated_at = NOW()
       WHERE transaction_id = $1 AND user_id = $2
+      RETURNING *
       `,
       [transaction_id, userId]
     );
 
-    res.json({ success: true });
+    const updatedTx = manualUpdate.rows[0] || classifiedUpdate.rows[0] || null;
+
+    if (updatedTx) {
+      await saveFeedback({
+        userId,
+        transactionId: transaction_id,
+        merchantName:
+          updatedTx.merchant_name ||
+          updatedTx.name ||
+          updatedTx.description ||
+          "unknown",
+        finalLabel: "business",
+      });
+    }
+
+    return res.json({
+      success: true,
+      manual_updated: manualUpdate.rowCount,
+      classified_updated: classifiedUpdate.rowCount,
+      transaction: updatedTx,
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to confirm transaction" });
+    console.error("Confirm transaction error:", err);
+    return res.status(500).json({
+      error: "Failed to confirm transaction",
+      details: err.message,
+    });
   }
 });
 
