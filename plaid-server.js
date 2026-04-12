@@ -23,9 +23,9 @@ const allowedOrigins = [
 ];
 const OpenAI = require("openai");
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
 const corsOptions = {
   origin(origin, callback) {
@@ -91,7 +91,7 @@ function roundToTwo(num) {
   return Math.round(num * 100) / 100;
 }
 
-function classifyTransaction(transaction) {
+async function classifyTransaction(transaction, userId = null) {
   const merchant = (transaction.merchant_name || transaction.name || "").toLowerCase();
 
   let category = "other";
@@ -201,37 +201,71 @@ function classifyTransaction(transaction) {
     classification_signals.push("merchant_match:unknown");
   }
 
-  let status = "needs_review";
-let user_confirmed = null;
+  if (userId) {
+    const feedback = await getFeedbackSummary(
+      userId,
+      transaction.merchant_name || transaction.name || ""
+    );
 
-// suggestion only — not final decision
-const suggested_deductible = deductiblePercent > 0;
-let is_deductible = suggested_deductible;
+    if (feedback.learnedLabel === "business") {
+      confidence = Math.min(0.98, confidence + feedback.confidenceBoost);
+
+      if (deductiblePercent === 0) {
+        deductiblePercent = 1.0;
+      }
+
+      classification_signals.push(
+        `feedback_business:${feedback.businessCount}`,
+        "learning:user_history"
+      );
+    } else if (feedback.learnedLabel === "personal") {
+      confidence = Math.min(0.98, confidence + feedback.confidenceBoost);
+      deductiblePercent = 0;
+
+      if (category === "other") {
+        category = "personal";
+      }
+
+      classification_signals.push(
+        `feedback_personal:${feedback.personalCount}`,
+        "learning:user_history"
+      );
+    }
+  }
+
+  const status = "needs_review";
+  const user_confirmed = null;
+  const suggested_deductible = deductiblePercent > 0;
+  const is_deductible = suggested_deductible;
 
   const deduction_amount = roundToTwo(transaction.amount * deductiblePercent);
   const tax_rate_applied = 0.3;
   const estimated_tax_savings = roundToTwo(deduction_amount * tax_rate_applied);
 
   return {
-  category,
-  confidence_score: confidence,
-  status, // always needs_review until user decides
-  is_deductible,
-  deductible_label: suggested_deductible
-    ? deductiblePercent === 1
-      ? "100% Deductible"
-      : "Partially Deductible"
-    : "Not Deductible",
-  deduction_amount,
-  tax_rate_applied,
-  estimated_tax_savings,
-  user_confirmed,
-  classification_signals,
-};
+    category,
+    confidence_score: confidence,
+    status,
+    is_deductible,
+    deductible_label: suggested_deductible
+      ? deductiblePercent === 1
+        ? "100% Deductible"
+        : "Partially Deductible"
+      : "Not Deductible",
+    deduction_amount,
+    tax_rate_applied,
+    estimated_tax_savings,
+    user_confirmed,
+    classification_signals,
+  };
 }
 
 async function getAISuggestion(transaction) {
   try {
+    if (!openai) {
+      return null;
+    }
+
     const prompt = `
 You are a tax assistant.
 
@@ -323,31 +357,36 @@ app.get("/api/mock-transactions", async (req, res) => {
       },
     ];
 
-    const enrichedTransactions = mockTransactions.map((transaction) => {
-      const classified = classifyTransaction(transaction);
-      const userId = req.query.userId || "mock-user";
-      const feedback = transactionFeedback[`${userId}:${transaction.transaction_id}`];
+    const userId = req.query.userId || "mock-user";
 
-      let finalStatus = classified.status;
-      let user_confirmed = classified.user_confirmed;
+const enrichedTransactions = await Promise.all(
+  mockTransactions.map(async (transaction) => {
+    const classified = await classifyTransaction(transaction, userId);
 
-      if (feedback) {
-        user_confirmed = feedback.user_confirmed;
-        finalStatus = feedback.user_confirmed ? "confirmed" : "rejected";
-      }
+    const feedback =
+      transactionFeedback[`${userId}:${transaction.transaction_id}`];
 
-      return {
-        ...transaction,
-        auto_classification: classified.category,
-        confidence_score: classified.confidence_score,
-        status: finalStatus,
-        deduction_amount: classified.deduction_amount,
-        tax_rate_applied: classified.tax_rate_applied,
-        estimated_tax_savings: classified.estimated_tax_savings,
-        user_confirmed,
-        classification_signals: classified.classification_signals,
-      };
-    });
+    let finalStatus = classified.status;
+    let user_confirmed = classified.user_confirmed;
+
+    if (feedback) {
+      user_confirmed = feedback.user_confirmed;
+      finalStatus = feedback.user_confirmed ? "confirmed" : "rejected";
+    }
+
+    return {
+      ...transaction,
+      auto_classification: classified.category,
+      confidence_score: classified.confidence_score,
+      status: finalStatus,
+      deduction_amount: classified.deduction_amount,
+      tax_rate_applied: classified.tax_rate_applied,
+      estimated_tax_savings: classified.estimated_tax_savings,
+      user_confirmed,
+      classification_signals: classified.classification_signals,
+    };
+  })
+);
 
     res.json({
       success: true,
@@ -886,7 +925,7 @@ const syncTransactionsToDb = async (userId, accessToken) => {
   const added = response.data.added || [];
 
   for (const tx of added) {
-    const ruleBased = classifyTransaction(tx);
+    const ruleBased = await classifyTransaction(tx, userId);
     const ai = await getAISuggestion(tx);
 
     let finalConfidence = ruleBased.confidence_score;
@@ -1079,7 +1118,7 @@ async function syncTransactions(userId, accessToken, itemId) {
   );
 
   for (const tx of added) {
-    const ruleBased = classifyTransaction(tx);
+    const ruleBased = await classifyTransaction(tx, userId);
     const ai = await getAISuggestion(tx);
 
     let finalConfidence = ruleBased.confidence_score;
@@ -1165,7 +1204,7 @@ async function syncTransactions(userId, accessToken, itemId) {
   }
 
   for (const tx of modified) {
-    const ruleBased = classifyTransaction(tx);
+    const ruleBased = await classifyTransaction(tx, userId);
     const ai = await getAISuggestion(tx);
 
     let finalConfidence = ruleBased.confidence_score;
@@ -1268,6 +1307,59 @@ async function saveFeedback({ userId, transactionId, merchantName, finalLabel })
   );
 }
 
+async function getFeedbackSummary(userId, merchantName) {
+  const merchantKey = normalizeMerchantKey(merchantName);
+
+  if (!userId || !merchantKey) {
+    return {
+      merchantKey,
+      total: 0,
+      businessCount: 0,
+      personalCount: 0,
+      learnedLabel: null,
+      confidenceBoost: 0,
+    };
+  }
+
+  const result = await db.query(
+    `
+    SELECT
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE final_label = 'business')::int AS business_count,
+      COUNT(*) FILTER (WHERE final_label = 'personal')::int AS personal_count
+    FROM transaction_feedback
+    WHERE user_id = $1
+      AND merchant_key = $2
+    `,
+    [userId, merchantKey]
+  );
+
+  const row = result.rows[0] || {};
+  const total = Number(row.total || 0);
+  const businessCount = Number(row.business_count || 0);
+  const personalCount = Number(row.personal_count || 0);
+
+  let learnedLabel = null;
+  let confidenceBoost = 0;
+
+  if (businessCount > personalCount) {
+    learnedLabel = "business";
+    confidenceBoost = Math.min(0.35, 0.12 + businessCount * 0.08);
+  } else if (personalCount > businessCount) {
+    learnedLabel = "personal";
+    confidenceBoost = Math.min(0.35, 0.12 + personalCount * 0.08);
+  }
+
+  return {
+    merchantKey,
+    total,
+    businessCount,
+    personalCount,
+    learnedLabel,
+    confidenceBoost,
+  };
+}
+
 
 app.get("/reset-bank", async (req, res) => {
   try {
@@ -1341,7 +1433,7 @@ app.post("/api/manual-entry", async (req, res) => {
       category: ["Manual Entry"],
     };
 
-    const classified = classifyTransaction(fakeTransaction);
+    const classified = await classifyTransaction(fakeTransaction, null);
 
     return res.json({
       success: true,
@@ -1385,7 +1477,7 @@ app.post("/api/manual-transaction", async (req, res) => {
       category: ["Manual Entry"],
     };
 
-    const classification = classifyTransaction(manualTx);
+    const classification = await classifyTransaction(manualTx, userId);
 
     const result = await db.query(
       `INSERT INTO manual_transactions (
