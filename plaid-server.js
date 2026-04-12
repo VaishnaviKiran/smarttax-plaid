@@ -1281,8 +1281,27 @@ function decodeWebhookKeyId(token) {
 }
 
 function normalizeMerchantKey(name) {
-  return String(name || "")
-    .toLowerCase()
+  const raw = String(name || "").toLowerCase();
+
+  if (raw.includes("zelle")) {
+    return "zelle_transfer";
+  }
+
+  if (
+    raw.includes("payment from chk") ||
+    raw.includes("ach hold") ||
+    raw.includes("ach payment") ||
+    raw.includes("mobile banking payment")
+  ) {
+    return "bank_payment_transfer";
+  }
+
+  if (raw.includes("shoonya tax")) {
+    return "shoonya_tax";
+  }
+
+  return raw
+    .replace(/conf[#\s\w-]*/g, " ")
     .replace(/[*#0-9]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
