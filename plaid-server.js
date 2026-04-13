@@ -1281,30 +1281,44 @@ function decodeWebhookKeyId(token) {
 }
 
 function normalizeMerchantKey(name) {
-  const raw = String(name || "").toLowerCase();
+  const raw = String(name || "").toLowerCase().trim();
 
+  // Group all Zelle variants
   if (raw.includes("zelle")) {
     return "zelle_transfer";
   }
 
+  // Group ACH / bank transfer style merchants
   if (
+    raw.includes("ach") ||
     raw.includes("payment from chk") ||
-    raw.includes("ach hold") ||
-    raw.includes("ach payment") ||
-    raw.includes("mobile banking payment")
+    raw.includes("mobile banking") ||
+    raw.includes("online payment") ||
+    raw.includes("banking payment")
   ) {
-    return "bank_payment_transfer";
+    return "bank_transfer";
   }
 
+  // Group rent-like payments
+  if (raw.includes("rent")) {
+    return "rent_payment";
+  }
+
+  // Group tax merchant
   if (raw.includes("shoonya tax")) {
     return "shoonya_tax";
   }
 
-  return raw
-    .replace(/conf[#\s\w-]*/g, " ")
-    .replace(/[*#0-9]/g, " ")
+  // Generic cleanup (important fix here 👇)
+  const cleaned = raw
+    .replace(/conf[#:\s\w-]*/g, " ") // remove confirmation junk
+    .replace(/[0-9]/g, " ")          // remove numbers
+    .replace(/\b(from|to|confirmation|conf|payment)\b/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+
+  // 🔥 fallback so empty string never happens
+  return cleaned || "other";
 }
 
 async function saveFeedback({ userId, transactionId, merchantName, finalLabel }) {
