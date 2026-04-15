@@ -70,6 +70,8 @@ const plaidClient = new PlaidApi(plaidConfig);
 // Temporary in-memory feedback store
 const transactionFeedback = {};
 
+
+
 // Optional auth middleware
 function requireAuth(req, res, next) {
   const header = req.headers.authorization;
@@ -201,37 +203,56 @@ async function classifyTransaction(transaction, userId = null) {
     classification_signals.push("merchant_match:unknown");
   }
 
-  if (userId) {
-    const feedback = await getFeedbackSummary(
-      userId,
-      transaction.merchant_name || transaction.name || ""
+ if (userId) {
+  const feedback = await getFeedbackSummary(
+    userId,
+    transaction.merchant_name || transaction.name || ""
+  );
+
+  if (feedback.learnedLabel === "business") {
+    if (feedback.strongSignal) {
+      category =
+        category === "personal" || category === "personal_transfer"
+          ? "other"
+          : category;
+
+      deductiblePercent = deductiblePercent > 0 ? deductiblePercent : 1.0;
+      confidence = Math.max(confidence, 0.88);
+    }
+
+    confidence = Math.min(0.98, confidence + feedback.confidenceBoost);
+
+    if (deductiblePercent === 0) {
+      deductiblePercent = 1.0;
+    }
+
+    classification_signals.push(
+      `feedback_business:${feedback.businessCount}`,
+      `feedback_total:${feedback.total}`,
+      feedback.strongSignal ? "learning:strong_user_history" : "learning:user_history"
     );
-
-    if (feedback.learnedLabel === "business") {
-      confidence = Math.min(0.98, confidence + feedback.confidenceBoost);
-
-      if (deductiblePercent === 0) {
-        deductiblePercent = 1.0;
-      }
-
-      classification_signals.push(
-        `feedback_business:${feedback.businessCount}`,
-        "learning:user_history"
-      );
-    } else if (feedback.learnedLabel === "personal") {
-      confidence = Math.min(0.98, confidence + feedback.confidenceBoost);
+  } else if (feedback.learnedLabel === "personal") {
+    if (feedback.strongSignal) {
+      category = "personal";
+      deductiblePercent = 0;
+      confidence = Math.max(confidence, 0.88);
+    } else {
       deductiblePercent = 0;
 
       if (category === "other") {
         category = "personal";
       }
-
-      classification_signals.push(
-        `feedback_personal:${feedback.personalCount}`,
-        "learning:user_history"
-      );
     }
+
+    confidence = Math.min(0.98, confidence + feedback.confidenceBoost);
+
+    classification_signals.push(
+      `feedback_personal:${feedback.personalCount}`,
+      `feedback_total:${feedback.total}`,
+      feedback.strongSignal ? "learning:strong_user_history" : "learning:user_history"
+    );
   }
+}
 
   const status = "needs_review";
   const user_confirmed = null;
@@ -1349,8 +1370,11 @@ async function getFeedbackSummary(userId, merchantName) {
       total: 0,
       businessCount: 0,
       personalCount: 0,
+      businessRatio: 0,
+      personalRatio: 0,
       learnedLabel: null,
       confidenceBoost: 0,
+      strongSignal: false,
     };
   }
 
@@ -1372,15 +1396,29 @@ async function getFeedbackSummary(userId, merchantName) {
   const businessCount = Number(row.business_count || 0);
   const personalCount = Number(row.personal_count || 0);
 
+  const businessRatio = total > 0 ? businessCount / total : 0;
+  const personalRatio = total > 0 ? personalCount / total : 0;
+
   let learnedLabel = null;
   let confidenceBoost = 0;
+  let strongSignal = false;
 
-  if (businessCount > personalCount) {
-    learnedLabel = "business";
-    confidenceBoost = Math.min(0.35, 0.12 + businessCount * 0.08);
-  } else if (personalCount > businessCount) {
-    learnedLabel = "personal";
-    confidenceBoost = Math.min(0.35, 0.12 + personalCount * 0.08);
+  if (total >= 2) {
+    if (businessRatio >= 0.75) {
+      learnedLabel = "business";
+      strongSignal = true;
+      confidenceBoost = Math.min(0.55, 0.2 + businessCount * 0.1);
+    } else if (personalRatio >= 0.75) {
+      learnedLabel = "personal";
+      strongSignal = true;
+      confidenceBoost = Math.min(0.55, 0.2 + personalCount * 0.1);
+    } else if (businessCount > personalCount) {
+      learnedLabel = "business";
+      confidenceBoost = Math.min(0.3, 0.1 + businessCount * 0.06);
+    } else if (personalCount > businessCount) {
+      learnedLabel = "personal";
+      confidenceBoost = Math.min(0.3, 0.1 + personalCount * 0.06);
+    }
   }
 
   return {
@@ -1388,8 +1426,11 @@ async function getFeedbackSummary(userId, merchantName) {
     total,
     businessCount,
     personalCount,
+    businessRatio,
+    personalRatio,
     learnedLabel,
     confidenceBoost,
+    strongSignal,
   };
 }
 
